@@ -19,7 +19,7 @@ Follow these steps to run the application locally.
 
 1. Navigate to the project directory:
    ```bash
-   cd c:/Users/frosty/Projects/camera
+   cd c:/<location>/camera
    ```
 2. Install the Express and CORS dependencies:
    ```bash
