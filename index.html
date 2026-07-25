@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CAMERA by frosty</title>
+  <meta name="description" content="Real-time hand fingertip gesture tracking with dynamic pixel effects and dynamic rectangle bounding overlay.">
+  <link rel="stylesheet" href="style.css">
+  
+  <!-- MediaPipe Hands & Camera Dependencies -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+  <div class="app-container">
+    
+    <!-- Top Bar -->
+    <header class="top-bar">
+      <div class="brand">
+        <h1 class="brand-title">CAMERA <span>/ WITH EFFECTS</span></h1>
+        <span class="badge-tag">COOL EFFECTS WITH YOUR HANDS</span>
+      </div>
+
+      <div class="top-stats">
+        <div class="stat-item">
+          <span>FPS:</span>
+          <span class="stat-val" id="stat-fps">00</span>
+        </div>
+        <div class="stat-item">
+          <span>HANDS:</span>
+          <span class="stat-val" id="stat-hands">0</span>
+        </div>
+        <div class="stat-item">
+          <span>FINGERTIPS:</span>
+          <span class="stat-val" id="stat-fingers">0</span>
+        </div>
+        <div class="stat-item">
+          <span>ZONE_SIZE:</span>
+          <span class="stat-val" id="stat-rect-size">0x0</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Workbench -->
+    <main class="workbench">
+      
+      <!-- Viewport Canvas Card -->
+      <section class="viewport-card">
+        <div class="viewport-header">
+          <div class="viewport-title">
+            <span class="dot-live"></span>
+            LIVE CAMERA FEED
+          </div>
+          <div class="viewport-actions">
+            <button class="btn-sm" id="btn-toggle-cam">INITIALIZE CAM</button>
+            <button class="btn-sm btn-accent" id="btn-snapshot">CAPTURE SNAPSHOT</button>
+          </div>
+        </div>
+
+        <div class="canvas-wrapper">
+          <!-- Hidden Video Feed Element -->
+          <video id="webcam-video" playsinline autoplay muted></video>
+
+          <!-- Main Interactive Processing Canvas -->
+          <canvas id="output-canvas"></canvas>
+
+          <!-- Dynamic HUD Info -->
+          <div class="hud-overlay" id="hud-overlay">
+            <div>MODE: <span id="hud-mode">NONE (NORMAL)</span></div>
+            <div>BOUNDS: <span id="hud-coords">[NO TARGET]</span></div>
+          </div>
+
+          <!-- Camera Start overlay prompt -->
+          <div class="cam-prompt" id="cam-prompt">
+            <div class="cam-prompt-icon">[ CAMERA ]</div>
+            <div class="cam-prompt-text">
+              ENABLE CAMERA TO START HAND & FINGERTIP TRACKING.<br>
+              Place index & middle fingers of one or both hands in frame to create the dynamic effect zone.
+            </div>
+            <button class="btn-sm btn-accent" id="btn-start-camera-main">START CAMERA FEED</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Control Drawer -->
+      <aside class="control-panel">
+        <div class="panel-header">EFFECT & TRACKING CONTROLS</div>
+
+        <!-- Section 1: Effect Selection -->
+        <div class="panel-section">
+          <div class="section-label">// ACTIVE CANVAS FILTER</div>
+          <div class="effect-grid" id="effect-grid">
+            <button class="effect-btn" data-effect="pixelate">PIXELATE</button>
+            <button class="effect-btn" data-effect="distortion">DISTORTION</button>
+            <button class="effect-btn" data-effect="rgbshift">RGB SHIFT</button>
+            <button class="effect-btn" data-effect="thermal">THERMAL</button>
+            <button class="effect-btn" data-effect="edges">SOBEL EDGES</button>
+            <button class="effect-btn" data-effect="glitch">GLITCH FX</button>
+            <button class="effect-btn" data-effect="ascii">ASCII MATRIX</button>
+            <button class="effect-btn active" data-effect="passthrough">NONE (NORMAL)</button>
+          </div>
+        </div>
+
+        <!-- Section 2: Effect Sliders -->
+        <div class="panel-section">
+          <div class="section-label">// EFFECT PARAMETERS</div>
+          
+          <div class="control-group">
+            <div class="control-title-row">
+              <span>EFFECT INTENSITY</span>
+              <span id="val-intensity">1.0</span>
+            </div>
+            <input type="range" class="range-input" id="slider-intensity" min="0.1" max="3.0" step="0.1" value="1.0">
+          </div>
+
+          <div class="control-group">
+            <div class="control-title-row">
+              <span>GRID / PIXEL SIZE</span>
+              <span id="val-grid">16px</span>
+            </div>
+            <input type="range" class="range-input" id="slider-grid" min="4" max="64" step="2" value="16">
+          </div>
+
+          <div class="control-group">
+            <div class="control-title-row">
+              <span>PADDING EXPANSION</span>
+              <span id="val-padding">20px</span>
+            </div>
+            <input type="range" class="range-input" id="slider-padding" min="0" max="100" step="5" value="20">
+          </div>
+        </div>
+
+        <!-- Section 3: Overlay Options -->
+        <div class="panel-section">
+          <div class="section-label">// DISPLAY OPTIONS</div>
+          
+          <div class="toggle-row">
+            <span>SHOW SKELETON LANDMARKS</span>
+            <input type="checkbox" class="checkbox-sharp" id="chk-landmarks" checked>
+          </div>
+
+          <div class="toggle-row">
+            <span>SHOW SHARP CORNER BRACKETS</span>
+            <input type="checkbox" class="checkbox-sharp" id="chk-brackets" checked>
+          </div>
+
+          <div class="toggle-row">
+            <span>INVERT HORIZONTAL MIRROR</span>
+            <input type="checkbox" class="checkbox-sharp" id="chk-mirror" checked>
+          </div>
+
+          <div class="toggle-row">
+            <span>MOUSE / TOUCH SIMULATOR</span>
+            <input type="checkbox" class="checkbox-sharp" id="chk-mouse-fallback">
+          </div>
+        </div>
+
+      </aside>
+
+    </main>
+
+    <!-- Info Footer -->
+    <footer class="info-bar">
+      <span class="footer-tag">MADE WITH LOVE AND COFFEE</span>
+      <div class="footer-links">
+        <a href="https://heyfrosty.space" target="_blank" rel="noopener">heyfrosty.space</a>
+        <a href="https://github.com/enafrosty" target="_blank" rel="noopener">github / @enafrosty</a>
+        <a href="mailto:iyad@heyfrosty.space">iyad@heyfrosty.space</a>
+      </div>
+    </footer>
+
+  </div>
+
+  <!-- Application Logic -->
+  <script src="app.js"></script>
+</body>
+</html>
