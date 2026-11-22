@@ -7,8 +7,7 @@
   <meta name="description" content="Real-time hand fingertip gesture tracking with dynamic pixel effects and dynamic rectangle bounding overlay.">
   <link rel="stylesheet" href="style.css">
   
-  <!-- MediaPipe Hands & Camera Dependencies -->
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <!-- MediaPipe Hands Dependency -->
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
 </head>
 <body>
@@ -69,6 +68,7 @@
           <div class="hud-overlay" id="hud-overlay">
             <div>MODE: <span id="hud-mode">NONE (NORMAL)</span></div>
             <div>BOUNDS: <span id="hud-coords">[NO TARGET]</span></div>
+            <div>SNAP: <span id="hud-snap">IDLE</span></div>
           </div>
 
           <!-- Camera Start overlay prompt -->
@@ -76,7 +76,7 @@
             <div class="cam-prompt-icon">[ CAMERA ]</div>
             <div class="cam-prompt-text">
               ENABLE CAMERA TO START HAND & FINGERTIP TRACKING.<br>
-              Place index & middle fingers of one or both hands in frame to create the dynamic effect zone.
+              Place both thumbs &amp; index fingers (4 fingertips) in frame to control the effect zone, then pinch to capture a snapshot.
             </div>
             <button class="btn-sm btn-accent" id="btn-start-camera-main">START CAMERA FEED</button>
           </div>

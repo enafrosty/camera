@@ -19,7 +19,7 @@ Follow these steps to run the application locally.
 
 1. Navigate to the project directory:
    ```bash
-   cd c:/<location>/camera
+   cd camera
    ```
 2. Install the Express and CORS dependencies:
    ```bash
@@ -37,6 +37,10 @@ Follow these steps to run the application locally.
    http://localhost:3000
    ```
 3. Click "START CAMERA FEED" or "INITIALIZE CAM" and grant webcam permissions to begin.
+4. Run the automated tests anytime with:
+   ```bash
+   npm test
+   ```
 
 ---
 
@@ -99,10 +103,10 @@ When a bounding box is active, the app grabs the corresponding pixel data from t
   Draws a solid dark background inside the box, then processes the area in steps matching the grid size. The local brightness is mapped to a character from the string `@#S%*+;:,. ` and rendered on screen as green monospaced text.
 
 ### 3. Gesture-Triggered Actions
-* **Pinch-to-Snap**:
-  If the normalized distance between the thumb and index finger drops below `0.05`, a snapshot timer is armed. After a 400ms delay (allowing the user to reopen their fingers so they do not block the image), the application captures the canvas content. The snap is downloaded as a PNG with the pixel effects applied but without the tracking lines or brackets visible.
+* **Pinch-to-Snap (4-Fingertip Frame)**:
+  The snapshot detector starts disarmed (`IDLE`) and waits through a short startup calibration window (`1200ms`). Once both hands are visible with all 4 tracked fingertips (both thumbs and both index fingers) held open above the scale-normalized open ratio (`0.52`, measured relative to palm length `wrist -> middle MCP`) for `350ms` / `4` frames, the frame arms (`FRAME ARMED — PINCH TO SNAP`). Pinching either hand below the scale-normalized threshold (`0.28`) for `2` consecutive frames schedules a snapshot after a `350ms` delay with a `2000ms` cooldown, capturing the canvas with pixel effects applied and without tracking overlays.
 * **Command Gesture (Easter Egg)**:
-  If a hand is detected where *only* the middle finger is extended (the wrist-to-tip distance is greater than 1.1 times the wrist-to-base joint distance) and all other fingers are curled, the browser instantly redirects to a famous music video URL.
+  If a hand is detected where *only* the middle finger is extended continuously for `600ms` / `6` frames, the browser redirects to a famous music video URL.
 
 ### 4. Interactive Configuration Panel
 * **Effect Intensity**: Adjusts variables like Sobel gain, RGB offset distance, or distortion amplitude.
@@ -121,7 +125,9 @@ When a bounding box is active, the app grabs the corresponding pixel data from t
 ├── app.js              # Main camera, gestures, and effects logic
 ├── index.html          # HUD interface layout
 ├── style.css           # Brutalist typography and stylesheet definitions
-├── public.zip          # Packaged archive of the web assets
+├── server.js           # Express + CORS local static server
+├── package.json        # Project scripts and dependencies
+├── tests/              # Unit and server smoke tests
 └── README.md           # Documentation file
 ```
 
