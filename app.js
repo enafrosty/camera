@@ -1,18 +1,271 @@
 /**
   * ; Copyright (C) 2025-2026 frosty (@enafrosty).
-  * `CAMERA / WITH EFFECTS` is a high-performance web application that leverages Google MediaPipe Hands 
-  * to track fingertip positions in real-time, dynamically mapping a local processing zone (bounding box) 
-  * around your index finger and thumb. Within this bounding box, customizable real-time pixel filters are 
-  * rendered on-the-fly.
+  * `CAMERA / WITH EFFECTS` is a high-performance web application that leverages Google MediaPipe Hands
+  * to track fingertip positions in real-time, dynamically mapping a local processing zone (bounding box)
+  * around your index fingers and thumbs. Within this bounding box, customizable real-time pixel filters
+  * are rendered on-the-fly.
  */
 
 (function () {
   'use strict';
 
+  const GESTURE_CONFIG = Object.freeze({
+    OPEN_RATIO: 0.52,
+    PINCH_RATIO: 0.28,
+    MIN_PALM_SCALE: 0.04,
+    ARM_HOLD_MS: 350,
+    ARM_HOLD_FRAMES: 4,
+    PINCH_HOLD_FRAMES: 2,
+    SNAP_DELAY_MS: 350,
+    COOLDOWN_MS: 2000,
+    STARTUP_GRACE_MS: 1200,
+    MIDDLE_HOLD_MS: 600,
+    MIDDLE_HOLD_FRAMES: 6
+  });
+
+  /** Returns wrist (0) to middle MCP (9) distance in normalized coordinates. */
+  function palmScale(hand) {
+    if (!hand || !hand[0] || !hand[9]) return 0;
+    return Math.hypot(hand[9].x - hand[0].x, hand[9].y - hand[0].y);
+  }
+
+  /** Computes thumb-to-index distance normalized by palm scale, or null when noisy/missing. */
+  function handPinchRatio(hand) {
+    if (!hand || !hand[0] || !hand[4] || !hand[8] || !hand[9]) return null;
+    const palm = palmScale(hand);
+    if (palm < GESTURE_CONFIG.MIN_PALM_SCALE) return null;
+    return Math.hypot(hand[4].x - hand[8].x, hand[4].y - hand[8].y) / palm;
+  }
+
+  /** Creates an initially disarmed gesture tracking state. */
+  function createGestureState(cameraStartedAt = 0) {
+    return {
+      armed: false,
+      openFrames: 0,
+      openSince: null,
+      pinchFrames: 0,
+      lastSnapTime: -Infinity,
+      middleFrames: 0,
+      middleSince: null,
+      middleFired: false,
+      cameraStartedAt,
+      status: 'IDLE'
+    };
+  }
+
+  function resetSnapArming(state) {
+    state.armed = false;
+    state.openFrames = 0;
+    state.openSince = null;
+    state.pinchFrames = 0;
+  }
+
+  /**
+   * Two-hand (4-fingertip) frame + pinch state machine:
+   * requires startup grace, 2 valid hands held open to arm, then sustained pinch to fire once.
+   */
+  function updateSnapGesture(state, landmarks, nowMs) {
+    const hands = Array.isArray(landmarks) ? landmarks : [];
+
+    if (nowMs - state.cameraStartedAt < GESTURE_CONFIG.STARTUP_GRACE_MS) {
+      resetSnapArming(state);
+      state.status = 'CALIBRATING...';
+      return { trigger: false, status: state.status };
+    }
+
+    if (nowMs - state.lastSnapTime < GESTURE_CONFIG.COOLDOWN_MS) {
+      resetSnapArming(state);
+      state.status = 'SNAPSHOT CAPTURED';
+      return { trigger: false, status: state.status };
+    }
+
+    if (hands.length !== 2) {
+      resetSnapArming(state);
+      state.status = hands.length === 0 ? 'NEED 2 HANDS (4 FINGERS)' : 'SHOW BOTH HANDS (4 FINGERS)';
+      return { trigger: false, status: state.status };
+    }
+
+    const r0 = handPinchRatio(hands[0]);
+    const r1 = handPinchRatio(hands[1]);
+    if (r0 === null || r1 === null) {
+      resetSnapArming(state);
+      state.status = 'SHOW BOTH HANDS (4 FINGERS)';
+      return { trigger: false, status: state.status };
+    }
+
+    const minR = Math.min(r0, r1);
+
+    if (!state.armed) {
+      if (r0 >= GESTURE_CONFIG.OPEN_RATIO && r1 >= GESTURE_CONFIG.OPEN_RATIO) {
+        state.openFrames += 1;
+        if (state.openSince === null) state.openSince = nowMs;
+        if (
+          state.openFrames >= GESTURE_CONFIG.ARM_HOLD_FRAMES &&
+          (nowMs - state.openSince) >= GESTURE_CONFIG.ARM_HOLD_MS
+        ) {
+          state.armed = true;
+          state.pinchFrames = 0;
+          state.status = 'FRAME ARMED — PINCH TO SNAP';
+          return { trigger: false, status: state.status };
+        }
+      } else {
+        state.openFrames = 0;
+        state.openSince = null;
+      }
+      state.status = 'OPEN BOTH HANDS TO ARM';
+      return { trigger: false, status: state.status };
+    }
+
+    if (minR <= GESTURE_CONFIG.PINCH_RATIO) {
+      state.pinchFrames += 1;
+      if (state.pinchFrames >= GESTURE_CONFIG.PINCH_HOLD_FRAMES) {
+        resetSnapArming(state);
+        state.lastSnapTime = nowMs;
+        state.status = 'SNAPSHOT CAPTURED';
+        return { trigger: true, status: state.status };
+      }
+    } else {
+      state.pinchFrames = 0;
+    }
+
+    state.status = 'FRAME ARMED — PINCH TO SNAP';
+    return { trigger: false, status: state.status };
+  }
+
+  /**
+   * Per-finger extension, orientation-independent.
+   * Thumb compares tip (4) vs IP (3) distance from pinky MCP (17).
+   */
+  function fingerStates(hand) {
+    if (!hand || !hand[0] || !hand[17]) {
+      return { thumb: false, index: false, middle: false, ring: false, pinky: false };
+    }
+    const wrist = hand[0];
+    const pinkyMcp = hand[17];
+    const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+    const ext = (tip, base) =>
+      Boolean(hand[tip] && hand[base] && dist(hand[tip], wrist) > dist(hand[base], wrist) * 1.1);
+    const thumb = Boolean(
+      hand[4] && hand[3] && dist(hand[4], pinkyMcp) > dist(hand[3], pinkyMcp) * 1.1
+    );
+    return {
+      thumb,
+      index: ext(8, 6),
+      middle: ext(12, 10),
+      ring: ext(16, 14),
+      pinky: ext(20, 18)
+    };
+  }
+
+  /** Edge-triggered sustained middle-finger command gesture detector. */
+  function updateMiddleFingerGesture(state, landmarks, nowMs) {
+    const hands = Array.isArray(landmarks) ? landmarks : [];
+    if (nowMs - state.cameraStartedAt < GESTURE_CONFIG.STARTUP_GRACE_MS) {
+      state.middleFrames = 0;
+      state.middleSince = null;
+      state.middleFired = false;
+      return false;
+    }
+
+    const active = hands.some((hand) => {
+      if (palmScale(hand) < GESTURE_CONFIG.MIN_PALM_SCALE) return false;
+      const f = fingerStates(hand);
+      return f.middle && !f.index && !f.ring && !f.pinky;
+    });
+
+    if (!active) {
+      state.middleFrames = 0;
+      state.middleSince = null;
+      state.middleFired = false;
+      return false;
+    }
+
+    state.middleFrames += 1;
+    if (state.middleSince === null) state.middleSince = nowMs;
+
+    if (
+      !state.middleFired &&
+      state.middleFrames >= GESTURE_CONFIG.MIDDLE_HOLD_FRAMES &&
+      (nowMs - state.middleSince) >= GESTURE_CONFIG.MIDDLE_HOLD_MS
+    ) {
+      state.middleFired = true;
+      return true;
+    }
+
+    return false;
+  }
+
+  /** Computes clamped bounding box around tracked fingertip points within [0..cw, 0..ch]. */
+  function computeTargetBox(tips, paddingPx, cw, ch) {
+    if (!Array.isArray(tips) || tips.length === 0 || cw <= 0 || ch <= 0) return null;
+
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const p of tips) {
+      minX = Math.min(minX, p.x);
+      minY = Math.min(minY, p.y);
+      maxX = Math.max(maxX, p.x);
+      maxY = Math.max(maxY, p.y);
+    }
+
+    minX = Math.max(0, minX - paddingPx);
+    minY = Math.max(0, minY - paddingPx);
+    maxX = Math.min(cw, maxX + paddingPx);
+    maxY = Math.min(ch, maxY + paddingPx);
+
+    let w = maxX - minX;
+    let h = maxY - minY;
+    const minSize = 40;
+    if (w < minSize) {
+      minX -= (minSize - w) / 2;
+      w = Math.min(minSize, cw);
+    }
+    if (h < minSize) {
+      minY -= (minSize - h) / 2;
+      h = Math.min(minSize, ch);
+    }
+
+    minX = Math.min(Math.max(0, minX), Math.max(0, cw - w));
+    minY = Math.min(Math.max(0, minY), Math.max(0, ch - h));
+    return { x: minX, y: minY, w, h };
+  }
+
+  /** Safe modulo that always yields [0, m - 1] for negative offsets. */
+  function positiveMod(n, m) {
+    if (m <= 0) return 0;
+    return ((n % m) + m) % m;
+  }
+
+  /** Clamps a pixel-grid block dimension so it never extends past the box boundary. */
+  function clampedBlockSize(pos, size, limit) {
+    return Math.max(0, Math.min(size, limit - pos));
+  }
+
+  const exportedApi = {
+    GESTURE_CONFIG,
+    palmScale,
+    handPinchRatio,
+    createGestureState,
+    updateSnapGesture,
+    fingerStates,
+    updateMiddleFingerGesture,
+    computeTargetBox,
+    positiveMod,
+    clampedBlockSize
+  };
+
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = exportedApi;
+  }
+
+  if (typeof window === 'undefined' || typeof document === 'undefined') {
+    return;
+  }
+
   // --- DOM ---
   const videoEl = document.getElementById('webcam-video');
   const canvas = document.getElementById('output-canvas');
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const viewportCard = document.querySelector('.viewport-card');
 
   const camPrompt = document.getElementById('cam-prompt');
   const btnStartCamMain = document.getElementById('btn-start-camera-main');
@@ -26,6 +279,7 @@
 
   const hudMode = document.getElementById('hud-mode');
   const hudCoords = document.getElementById('hud-coords');
+  const hudSnap = document.getElementById('hud-snap');
 
   const effectBtns = document.querySelectorAll('.effect-btn');
   const sliderIntensity = document.getElementById('slider-intensity');
@@ -42,6 +296,7 @@
 
   // --- State ---
   let isCameraActive = false;
+  let isStartingCamera = false;
   let mediaStream = null;
   let handsTracker = null;
   let trackingReady = false;
@@ -53,8 +308,8 @@
   let paddingPx = 20;
   let isMirroring = true;
 
-  let lastFrameTime = performance.now();
-  let fpsHistory = [];
+  let lastFrameTime = null;
+  const fpsHistory = [];
   let animTime = 0;
 
   let targetBox = null;
@@ -65,28 +320,60 @@
   let detectedHandCount = 0;
   let totalFingertips = 0;
 
-  // Pinch-to-snap: fire once when thumb + index tips touch, re-arm when they separate.
-  let pinchArmed = true;      // true = fingers currently open, ready to fire
+  let gestureState = createGestureState(0);
+  let snapTimerId = null;
   let pendingSnapshot = false;
-  let lastActionGesture = null; // 'thumb' | 'middle' | null — for edge-triggered gestures
-  const PINCH_CLOSE = 0.05;   // normalized thumb-index distance below this = pinched
-  const PINCH_OPEN = 0.09;    // must separate past this to re-arm (hysteresis)
-  const SNAP_DELAY_MS = 400;  // wait after pinch so fingers reopen before the shot fires
+  let flashUntil = 0;
 
-  // Mouse fallback
+  // Mouse / touch simulator
   let isMouseDown = false;
   let mouseStartPos = { x: 100, y: 100 };
   let mouseCurrentPos = { x: 300, y: 250 };
 
-  // Separate buffer to feed MediaPipe — never the visible canvas or raw video.
+  // Separate buffers: MediaPipe tracking, distortion effect, and snapshot stamping.
   const trackCanvas = document.createElement('canvas');
   trackCanvas.width = 320;
   trackCanvas.height = 180;
   const trackCtx = trackCanvas.getContext('2d');
 
+  const effectCanvas = document.createElement('canvas');
+  const effectCtx = effectCanvas.getContext('2d');
+
+  const snapshotCanvas = document.createElement('canvas');
+  const snapshotCtx = snapshotCanvas.getContext('2d');
+
+  function updateSnapHud(statusText, isArmed) {
+    if (!hudSnap) return;
+    hudSnap.textContent = statusText;
+    hudSnap.classList.toggle('hud-snap-armed', Boolean(isArmed));
+  }
+
+  function cancelPendingSnap() {
+    if (snapTimerId !== null) {
+      clearTimeout(snapTimerId);
+      snapTimerId = null;
+    }
+    pendingSnapshot = false;
+  }
+
+  function syncCanvasDimensions() {
+    const vw = videoEl.videoWidth || 1280;
+    const vh = videoEl.videoHeight || 720;
+    if (canvas.width !== vw || canvas.height !== vh) {
+      canvas.width = vw;
+      canvas.height = vh;
+    }
+    const targetTrackH = Math.max(1, Math.round(320 * (canvas.height / canvas.width)));
+    if (trackCanvas.width !== 320 || trackCanvas.height !== targetTrackH) {
+      trackCanvas.width = 320;
+      trackCanvas.height = targetTrackH;
+    }
+  }
+
   function init() {
     canvas.width = 1280;
     canvas.height = 720;
+    updateSnapHud('IDLE', false);
     bindEvents();
     initMediaPipeHands();
     requestAnimationFrame(renderLoop);
@@ -116,50 +403,35 @@
     }
   }
 
-  // Per-finger extension, orientation-independent: a finger is extended when its tip sits
-  // farther from the wrist than its middle joint. Returns {thumb,index,middle,ring,pinky}.
-  function fingerStates(hand) {
-    const wrist = hand[0];
-    const d = (p) => Math.hypot(p.x - wrist.x, p.y - wrist.y);
-    const ext = (tip, base) => hand[tip] && hand[base] && d(hand[tip]) > d(hand[base]) * 1.1;
-    return {
-      thumb: ext(4, 2), index: ext(8, 6), middle: ext(12, 10),
-      ring: ext(16, 14), pinky: ext(20, 18)
-    };
-  }
-
   function onHandResults(results) {
+    if (!isCameraActive || chkMouseFallback.checked) return;
+
+    const nowMs = performance.now();
     detectedLandmarks = results.multiHandLandmarks || [];
     detectedHandCount = detectedLandmarks.length;
 
-    // Pinch detection: closest thumb-index distance across all hands (normalized coords).
-    let minPinch = Infinity;
-    detectedLandmarks.forEach((hand) => {
-      if (hand[4] && hand[8]) {
-        minPinch = Math.min(minPinch, Math.hypot(hand[4].x - hand[8].x, hand[4].y - hand[8].y));
+    if (snapTimerId === null && !pendingSnapshot) {
+      const snapOutcome = updateSnapGesture(gestureState, detectedLandmarks, nowMs);
+      updateSnapHud(snapOutcome.status, gestureState.armed);
+      if (snapOutcome.trigger) {
+        snapTimerId = setTimeout(() => {
+          snapTimerId = null;
+          if (isCameraActive && !chkMouseFallback.checked) {
+            pendingSnapshot = true;
+          }
+        }, GESTURE_CONFIG.SNAP_DELAY_MS);
       }
-    });
-    if (minPinch > PINCH_OPEN) pinchArmed = true;
-    else if (minPinch < PINCH_CLOSE && pinchArmed) {
-      pinchArmed = false;
-      setTimeout(() => { pendingSnapshot = true; }, SNAP_DELAY_MS); // let fingers reopen first
     }
 
-    // Command gestures (edge-triggered: fire once when the pose first appears).
-    let gesture = null;
-    for (const hand of detectedLandmarks) {
-      const f = fingerStates(hand);
-      if (f.middle && !f.index && !f.ring && !f.pinky) { gesture = 'middle'; break; }
-    }
-    if (gesture && gesture !== lastActionGesture && gesture === 'middle') {
+    if (updateMiddleFingerGesture(gestureState, detectedLandmarks, nowMs)) {
       window.location.href = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
+      return;
     }
-    lastActionGesture = gesture;
 
     const cw = canvas.width, ch = canvas.height;
     const tips = [];
     detectedLandmarks.forEach((hand) => {
-      [4, 8].forEach((idx) => {            // 4 = thumb tip, 8 = index tip
+      [4, 8].forEach((idx) => { // 4 = thumb tip, 8 = index tip
         if (!hand[idx]) return;
         let x = hand[idx].x * cw;
         const y = hand[idx].y * ch;
@@ -168,30 +440,21 @@
       });
     });
     totalFingertips = tips.length;
-
-    if (tips.length === 0) {
-      if (!chkMouseFallback.checked) targetBox = null;
-      return;
-    }
-
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    tips.forEach(p => {
-      minX = Math.min(minX, p.x); minY = Math.min(minY, p.y);
-      maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y);
-    });
-    minX = Math.max(0, minX - paddingPx);
-    minY = Math.max(0, minY - paddingPx);
-    maxX = Math.min(cw, maxX + paddingPx);
-    maxY = Math.min(ch, maxY + paddingPx);
-    let w = maxX - minX, h = maxY - minY;
-    if (w < 40) { minX -= 20; w = 40; }
-    if (h < 40) { minY -= 20; h = 40; }
-    targetBox = { x: minX, y: minY, w, h };
+    targetBox = computeTargetBox(tips, paddingPx, cw, ch);
   }
 
   // --- Camera ---
   async function startCamera() {
-    if (isCameraActive) return;
+    if (isCameraActive || isStartingCamera) return;
+    if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+      alert('Camera API is unavailable. Please open this page over HTTPS or http://localhost.');
+      return;
+    }
+
+    isStartingCamera = true;
+    btnToggleCam.disabled = true;
+    btnStartCamMain.disabled = true;
+
     try {
       mediaStream = await navigator.mediaDevices.getUserMedia({
         video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
@@ -199,26 +462,45 @@
       });
       videoEl.srcObject = mediaStream;
       await videoEl.play();
+      syncCanvasDimensions();
       isCameraActive = true;
+      cancelPendingSnap();
+      gestureState = createGestureState(performance.now());
+      updateSnapHud(chkMouseFallback.checked ? 'SIMULATOR' : gestureState.status, false);
+      if (viewportCard) viewportCard.classList.add('is-live');
       camPrompt.style.display = 'none';
       btnToggleCam.textContent = 'STOP CAMERA';
     } catch (err) {
+      if (mediaStream) {
+        mediaStream.getTracks().forEach((t) => t.stop());
+        mediaStream = null;
+      }
+      videoEl.srcObject = null;
       alert('Unable to access webcam: ' + err.message);
       console.error(err);
+    } finally {
+      isStartingCamera = false;
+      btnToggleCam.disabled = false;
+      btnStartCamMain.disabled = false;
     }
   }
 
   function stopCamera() {
     if (mediaStream) {
-      mediaStream.getTracks().forEach(t => t.stop());
+      mediaStream.getTracks().forEach((t) => t.stop());
       mediaStream = null;
     }
     videoEl.srcObject = null;
     isCameraActive = false;
+    cancelPendingSnap();
+    gestureState = createGestureState(0);
     detectedLandmarks = [];
     detectedHandCount = 0;
     totalFingertips = 0;
     targetBox = null;
+    smoothedBox = null;
+    updateSnapHud(chkMouseFallback.checked ? 'SIMULATOR' : 'IDLE', false);
+    if (viewportCard) viewportCard.classList.remove('is-live');
     camPrompt.style.display = 'flex';
     btnToggleCam.textContent = 'INITIALIZE CAM';
   }
@@ -231,14 +513,18 @@
   function renderLoop(timestamp) {
     animTime += 0.03;
 
-    const delta = timestamp - lastFrameTime;
-    lastFrameTime = timestamp;
-    if (delta > 0) {
-      fpsHistory.push(1000 / delta);
-      if (fpsHistory.length > 20) fpsHistory.shift();
-      const avg = Math.round(fpsHistory.reduce((a, b) => a + b, 0) / fpsHistory.length);
-      statFps.textContent = avg < 10 ? '0' + avg : avg;
+    if (lastFrameTime !== null) {
+      const delta = timestamp - lastFrameTime;
+      if (delta > 0) {
+        fpsHistory.push(1000 / delta);
+        if (fpsHistory.length > 20) fpsHistory.shift();
+        const avg = Math.round(fpsHistory.reduce((a, b) => a + b, 0) / fpsHistory.length);
+        statFps.textContent = avg < 10 ? '0' + avg : String(avg);
+      }
     }
+    lastFrameTime = timestamp;
+
+    if (videoHasFrame()) syncCanvasDimensions();
 
     const w = canvas.width, h = canvas.height;
     ctx.clearRect(0, 0, w, h);
@@ -254,14 +540,20 @@
       drawPlaceholderBackground(w, h);
     }
 
-    // 2. Mouse fallback
+    // 2. Mouse / Touch simulator
     if (chkMouseFallback.checked) {
-      const mx = Math.min(mouseStartPos.x, mouseCurrentPos.x);
-      const my = Math.min(mouseStartPos.y, mouseCurrentPos.y);
-      let mw = Math.abs(mouseCurrentPos.x - mouseStartPos.x);
-      let mh = Math.abs(mouseCurrentPos.y - mouseStartPos.y);
-      if (mw < 40) mw = 120;
-      if (mh < 40) mh = 120;
+      const x1 = Math.max(0, Math.min(w, mouseStartPos.x));
+      const y1 = Math.max(0, Math.min(h, mouseStartPos.y));
+      const x2 = Math.max(0, Math.min(w, mouseCurrentPos.x));
+      const y2 = Math.max(0, Math.min(h, mouseCurrentPos.y));
+      let mx = Math.min(x1, x2);
+      let my = Math.min(y1, y2);
+      let mw = Math.abs(x2 - x1);
+      let mh = Math.abs(y2 - y1);
+      if (mw < 40) mw = Math.min(120, w);
+      if (mh < 40) mh = Math.min(120, h);
+      mx = Math.min(mx, Math.max(0, w - mw));
+      my = Math.min(my, Math.max(0, h - mh));
       targetBox = { x: mx, y: my, w: mw, h: mh };
       detectedHandCount = 1;
       totalFingertips = 2;
@@ -283,12 +575,21 @@
     // 4. Effect inside the zone
     if (smoothedBox && smoothedBox.w > 5 && smoothedBox.h > 5) applyCanvasEffect(smoothedBox);
 
-    // 4b. Pinch snapshot — capture here so the image has the effect but NOT the overlays below.
-    if (pendingSnapshot) { pendingSnapshot = false; captureSnapshot(); }
+    // 4b. Snapshot — capture here so the image has the effect but NOT the overlays below.
+    if (pendingSnapshot) {
+      pendingSnapshot = false;
+      captureSnapshot();
+    }
 
     // 5. Overlays
     if (chkLandmarks.checked && detectedLandmarks.length > 0) drawHandLandmarks(w, h);
     if (chkBrackets.checked && smoothedBox) drawSharpBrackets(smoothedBox);
+
+    if (timestamp < flashUntil) {
+      const alpha = Math.min(1, (flashUntil - timestamp) / 180) * 0.45;
+      ctx.fillStyle = `rgba(255, 246, 234, ${alpha.toFixed(3)})`;
+      ctx.fillRect(0, 0, w, h);
+    }
 
     // 6. HUD
     statHands.textContent = detectedHandCount;
@@ -299,8 +600,8 @@
       statRectSize.textContent = `${rw}x${rh}`;
       hudCoords.textContent = `[${rx}, ${ry}] -> [${rx + rw}, ${ry + rh}]`;
     } else {
-      statRectSize.textContent = `0x0`;
-      hudCoords.textContent = `[NO TARGET]`;
+      statRectSize.textContent = '0x0';
+      hudCoords.textContent = '[NO TARGET]';
     }
 
     requestAnimationFrame(renderLoop);
@@ -313,7 +614,7 @@
     sending = true;
     trackCtx.drawImage(videoEl, 0, 0, trackCanvas.width, trackCanvas.height);
     Promise.resolve(handsTracker.send({ image: trackCanvas }))
-      .catch(err => console.error('tracking send failed:', err))
+      .catch((err) => console.error('tracking send failed:', err))
       .finally(() => { sending = false; });
   }
 
@@ -341,26 +642,33 @@
       case 'pixelate': {
         const size = Math.max(4, Math.floor(gridSize));
         for (let py = 0; py < bh; py += size) {
+          const rectH = clampedBlockSize(py, size, bh);
           for (let px = 0; px < bw; px += size) {
+            const rectW = clampedBlockSize(px, size, bw);
             const sx = Math.min(px + (size >> 1), bw - 1);
             const sy = Math.min(py + (size >> 1), bh - 1);
             const i = (sy * bw + sx) * 4;
             ctx.fillStyle = `rgb(${data[i]}, ${data[i + 1]}, ${data[i + 2]})`;
-            ctx.fillRect(bx + px, by + py, size, size);
+            ctx.fillRect(bx + px, by + py, rectW, rectH);
           }
         }
         break;
       }
       case 'distortion': {
-        const tmp = document.createElement('canvas');
-        tmp.width = bw; tmp.height = bh;
-        tmp.getContext('2d').putImageData(imgData, 0, 0);
+        if (effectCanvas.width !== bw || effectCanvas.height !== bh) {
+          effectCanvas.width = bw;
+          effectCanvas.height = bh;
+        }
+        effectCtx.putImageData(imgData, 0, 0);
         ctx.save();
-        ctx.beginPath(); ctx.rect(bx, by, bw, bh); ctx.clip();
+        ctx.beginPath();
+        ctx.rect(bx, by, bw, bh);
+        ctx.clip();
         const freq = 0.05 * intensity, amp = 12 * intensity;
         for (let y = 0; y < bh; y += 4) {
+          const sliceH = Math.min(4, bh - y);
           const dx = Math.sin(y * freq + animTime * 4) * amp;
-          ctx.drawImage(tmp, 0, y, bw, 4, bx + dx, by + y, bw, 4);
+          ctx.drawImage(effectCanvas, 0, y, bw, sliceH, bx + dx, by + y, bw, sliceH);
         }
         ctx.restore();
         break;
@@ -374,7 +682,10 @@
             const d = (y * bw + x) * 4;
             const r = (y * bw + Math.min(bw - 1, x + off)) * 4;
             const b = (y * bw + Math.max(0, x - off)) * 4;
-            o[d] = data[r]; o[d + 1] = data[d + 1]; o[d + 2] = data[b + 2]; o[d + 3] = 255;
+            o[d] = data[r];
+            o[d + 1] = data[d + 1];
+            o[d + 2] = data[b + 2];
+            o[d + 3] = 255;
           }
         }
         ctx.putImageData(out, bx, by);
@@ -396,8 +707,12 @@
         break;
       }
       case 'edges': {
+        if (bw < 3 || bh < 3) return;
         const out = ctx.createImageData(bw, bh);
         const o = out.data;
+        for (let i = 0; i < o.length; i += 4) {
+          o[i] = 13; o[i + 1] = 11; o[i + 2] = 12; o[i + 3] = 255;
+        }
         for (let y = 1; y < bh - 1; y++) {
           for (let x = 1; x < bw - 1; x++) {
             let gx = 0, gy = 0;
@@ -418,18 +733,20 @@
         break;
       }
       case 'glitch': {
+        if (bh <= 4 || bw <= 1) return;
         const out = ctx.createImageData(bw, bh);
         out.data.set(data);
         const o = out.data;
         const slices = Math.floor(6 * intensity);
+        const maxSy = Math.max(1, bh - 4);
         for (let s = 0; s < slices; s++) {
           if (Math.random() >= 0.6) continue;
-          const sy = Math.floor(Math.random() * (bh - 10));
-          const sh = Math.floor(Math.random() * 15) + 4;
+          const sy = Math.floor(Math.random() * maxSy);
+          const sh = Math.min(bh - sy, Math.floor(Math.random() * 15) + 4);
           const shift = Math.floor((Math.random() - 0.5) * 30 * intensity);
-          for (let y = sy; y < Math.min(bh, sy + sh); y++) {
+          for (let y = sy; y < sy + sh; y++) {
             for (let x = 0; x < bw; x++) {
-              const sxi = (x - shift + bw) % bw;
+              const sxi = positiveMod(x - shift, bw);
               const si = (y * bw + sxi) * 4;
               const di = (y * bw + x) * 4;
               o[di] = data[si]; o[di + 1] = data[si + 1]; o[di + 2] = data[si + 2];
@@ -440,6 +757,10 @@
         break;
       }
       case 'ascii': {
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(bx, by, bw, bh);
+        ctx.clip();
         ctx.fillStyle = '#0D0B0C';
         ctx.fillRect(bx, by, bw, bh);
         const chars = '@#S%*+;:,. ';
@@ -450,10 +771,11 @@
           for (let px = 0; px < bw; px += fs) {
             const idx = (py * bw + px) * 4;
             const lum = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
-            const ci = Math.floor((1 - lum / 255) * (chars.length - 1));
+            const ci = Math.max(0, Math.min(chars.length - 1, Math.floor((1 - lum / 255) * (chars.length - 1))));
             ctx.fillText(chars[ci], bx + px, by + py + fs);
           }
         }
+        ctx.restore();
         break;
       }
     }
@@ -470,6 +792,7 @@
     ctx.lineWidth = 2;
     detectedLandmarks.forEach((hand) => {
       connections.forEach(([i, j]) => {
+        if (!hand[i] || !hand[j]) return;
         let x1 = hand[i].x * w, y1 = hand[i].y * h;
         let x2 = hand[j].x * w, y2 = hand[j].y * h;
         if (isMirroring) { x1 = w - x1; x2 = w - x2; }
@@ -477,7 +800,9 @@
         ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
       });
       [4, 8].forEach((idx) => {
-        let px = hand[idx].x * w; const py = hand[idx].y * h;
+        if (!hand[idx]) return;
+        let px = hand[idx].x * w;
+        const py = hand[idx].y * h;
         if (isMirroring) px = w - px;
         ctx.fillStyle = '#00FF88';
         ctx.fillRect(px - 5, py - 5, 10, 10);
@@ -500,71 +825,104 @@
   }
 
   function captureSnapshot() {
-    // Stamp the tag onto the current (clean) frame before encoding. Matches the .section-label
-    // style: mono, uppercase, wide tracking. Cleared by the next frame's clearRect.
-    ctx.save();
-    ctx.font = '12px ui-monospace, "Cascadia Mono", Consolas, monospace';
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'bottom';
-    const tag = 'M A D E   W I T H   L O V E   A N D   C O F F E E';
-    ctx.fillStyle = 'rgba(13, 11, 12, 0.6)';
-    ctx.fillText(tag, 26, canvas.height - 21);
-    ctx.fillStyle = '#00FF88';
-    ctx.fillText(tag, 24, canvas.height - 23);
-    ctx.restore();
+    snapshotCanvas.width = canvas.width;
+    snapshotCanvas.height = canvas.height;
+    snapshotCtx.clearRect(0, 0, snapshotCanvas.width, snapshotCanvas.height);
+    snapshotCtx.drawImage(canvas, 0, 0);
 
-    // Blob + object URL: far faster and won't hang the tab like a multi-MB base64 data URL.
-    canvas.toBlob((blob) => {
+    // Stamp watermark onto the offscreen snapshot buffer so the live canvas never flickers.
+    snapshotCtx.save();
+    snapshotCtx.font = '12px ui-monospace, "Cascadia Mono", Consolas, monospace';
+    snapshotCtx.textAlign = 'left';
+    snapshotCtx.textBaseline = 'bottom';
+    const tag = 'M A D E   W I T H   L O V E   A N D   C O F F E E';
+    snapshotCtx.fillStyle = 'rgba(13, 11, 12, 0.6)';
+    snapshotCtx.fillText(tag, 26, snapshotCanvas.height - 21);
+    snapshotCtx.fillStyle = '#00FF88';
+    snapshotCtx.fillText(tag, 24, snapshotCanvas.height - 23);
+    snapshotCtx.restore();
+
+    flashUntil = performance.now() + 180;
+
+    snapshotCanvas.toBlob((blob) => {
       if (!blob) return;
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
       a.download = `cam_fx_${Date.now()}.png`;
       a.click();
-      setTimeout(() => URL.revokeObjectURL(url), 1000); // revoke after the download starts
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
     }, 'image/png');
   }
 
   function bindEvents() {
     btnStartCamMain.addEventListener('click', startCamera);
-    btnToggleCam.addEventListener('click', () => isCameraActive ? stopCamera() : startCamera());
-    btnSnapshot.addEventListener('click', captureSnapshot);
+    btnToggleCam.addEventListener('click', () => (isCameraActive ? stopCamera() : startCamera()));
+    btnSnapshot.addEventListener('click', () => {
+      pendingSnapshot = true;
+    });
 
-    effectBtns.forEach(btn => btn.addEventListener('click', () => {
-      effectBtns.forEach(b => b.classList.remove('active'));
+    effectBtns.forEach((btn) => btn.addEventListener('click', () => {
+      effectBtns.forEach((b) => b.classList.remove('active'));
       btn.classList.add('active');
       currentEffect = btn.dataset.effect;
       hudMode.textContent = btn.textContent.trim();
     }));
 
-    sliderIntensity.addEventListener('input', e => {
-      intensity = parseFloat(e.target.value); valIntensity.textContent = intensity.toFixed(1);
+    sliderIntensity.addEventListener('input', (e) => {
+      intensity = parseFloat(e.target.value);
+      valIntensity.textContent = intensity.toFixed(1);
     });
-    sliderGrid.addEventListener('input', e => {
-      gridSize = parseInt(e.target.value, 10); valGrid.textContent = `${gridSize}px`;
+    sliderGrid.addEventListener('input', (e) => {
+      gridSize = parseInt(e.target.value, 10);
+      valGrid.textContent = `${gridSize}px`;
     });
-    sliderPadding.addEventListener('input', e => {
-      paddingPx = parseInt(e.target.value, 10); valPadding.textContent = `${paddingPx}px`;
+    sliderPadding.addEventListener('input', (e) => {
+      paddingPx = parseInt(e.target.value, 10);
+      valPadding.textContent = `${paddingPx}px`;
     });
-    chkMirror.addEventListener('change', e => { isMirroring = e.target.checked; });
+    chkMirror.addEventListener('change', (e) => { isMirroring = e.target.checked; });
 
-    const toLocal = e => {
+    chkMouseFallback.addEventListener('change', () => {
+      isMouseDown = false;
+      targetBox = null;
+      smoothedBox = null;
+      detectedLandmarks = [];
+      detectedHandCount = 0;
+      totalFingertips = 0;
+      cancelPendingSnap();
+      gestureState = createGestureState(isCameraActive ? performance.now() : 0);
+      canvas.classList.toggle('sim-active', chkMouseFallback.checked);
+      updateSnapHud(
+        chkMouseFallback.checked ? 'SIMULATOR' : (isCameraActive ? gestureState.status : 'IDLE'),
+        false
+      );
+    });
+
+    const toLocal = (e) => {
       const rect = canvas.getBoundingClientRect();
+      if (!rect.width || !rect.height) return { x: 0, y: 0 };
       return {
-        x: (e.clientX - rect.left) * (canvas.width / rect.width),
-        y: (e.clientY - rect.top) * (canvas.height / rect.height)
+        x: Math.max(0, Math.min(canvas.width, (e.clientX - rect.left) * (canvas.width / rect.width))),
+        y: Math.max(0, Math.min(canvas.height, (e.clientY - rect.top) * (canvas.height / rect.height)))
       };
     };
-    canvas.addEventListener('mousedown', e => {
+
+    canvas.addEventListener('pointerdown', (e) => {
       if (!chkMouseFallback.checked) return;
       isMouseDown = true;
+      if (canvas.setPointerCapture) {
+        try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+      }
       mouseStartPos = toLocal(e);
       mouseCurrentPos = { ...mouseStartPos };
     });
-    canvas.addEventListener('mousemove', e => {
+    canvas.addEventListener('pointermove', (e) => {
       if (chkMouseFallback.checked && isMouseDown) mouseCurrentPos = toLocal(e);
     });
-    window.addEventListener('mouseup', () => { isMouseDown = false; });
+    const stopDrag = () => { isMouseDown = false; };
+    window.addEventListener('pointerup', stopDrag);
+    window.addEventListener('pointercancel', stopDrag);
   }
 
   window.addEventListener('DOMContentLoaded', init);
